@@ -33,7 +33,7 @@ pub fn audio_processing(
     // .expect("Failed to create coefficients");
 
     // state machine init
-    let mut aec_state = FdafAec::<AEC_FFT_SIZE>::new(STEP_SIZE, 0.9, 10e-8);
+    let mut aec_state = FdafAec::<AEC_FFT_SIZE>::new(STEP_SIZE, 0.9, 10e-4);
     let mut denoise = DenoiseState::new();
     let mut mic_hpfilter = DirectForm2Transposed::<f32>::new(coeffs);
     let mut far_end_hpfilter = DirectForm2Transposed::<f32>::new(coeffs);
@@ -184,6 +184,6 @@ fn sanitize(frame: &mut [f32]) {
 
 fn safety_out(frame: &mut [f32]) {
     for s in frame.iter_mut() {
-        *s = if s.tanh().abs() > 0.99 { 0.0 } else { *s };
+        *s = if s.tanh().abs() > 0.99 { 0.0 } else { *s } * 0.3;
     }
 }
