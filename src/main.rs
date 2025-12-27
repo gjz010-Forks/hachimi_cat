@@ -12,40 +12,15 @@ fn main() -> anyhow::Result<()> {
     let mic_buf = HeapRb::<f32>::new(RB_SIZE);
     let (mut mic_prod, mic_cons) = mic_buf.split();
 
-    let far_end_buf = HeapRb::<f32>::new(RB_SIZE);
-    let (mut far_end_prod, far_end_cons) = far_end_buf.split();
+    let speaker_buf = HeapRb::<f32>::new(RB_SIZE);
+    let (speaker_prod, mut speaker_cons) = speaker_buf.split();
 
     let processed_buf = HeapRb::<f32>::new(RB_SIZE);
-    let (processed_prod, mut processed_cons) = processed_buf.split();
+    let (processed_prod, processed_cons) = processed_buf.split();
 
     let host = cpal::default_host();
 
-    // let config = InitializationConfig {
-    //     num_capture_channels: 1,
-    //     num_render_channels: 1,
-    //     sample_rate: Some(SAMPLE_RATE),
-    //     ..InitializationConfig::default()
-    // };
-    // let mut audio_processor = Processor::new(&config)?;
-    // let config = Config {
-    //     echo_cancellation: Some(EchoCancellation {
-    //         suppression_level: EchoCancellationSuppressionLevel::High,
-    //         enable_delay_agnostic: true,
-    //         enable_extended_filter: false,
-    //         stream_delay_ms: None,
-    //     }),
-    //     noise_suppression: Some(NoiseSuppression {
-    //         suppression_level: NoiseSuppressionLevel::High,
-    //     }),
-    //     gain_control: Some(GainControl {
-    //         mode: GainControlMode::AdaptiveDigital,
-    //         target_level_dbfs: 3,
-    //         compression_gain_db: 0,
-    //         enable_limiter: true,
-    //     }),
-    //     ..Config::default()
-    // };
-    // audio_processor.set_config(config);
+    // config
 
     let input_device = host
         .default_input_device()
@@ -79,6 +54,8 @@ fn main() -> anyhow::Result<()> {
 
     let output_config: StreamConfig = output_config.into();
 
+    // run
+
     let input_stream = input_device.build_input_stream(
         &input_config,
         move |data, _| {
@@ -91,25 +68,15 @@ fn main() -> anyhow::Result<()> {
     let output_stream = output_device.build_output_stream(
         &output_config,
         move |output, _| {
-            // let mut output_frame: [f32; FRAME_SIZE] =
-            // unsafe { MaybeUninit::uninit().assume_init() };
-            // loop {
-            // if processed_cons.occupied_len() >= FRAME_SIZE {
-            // processed_cons.pop_slice(&mut output_frame);
-
-            // for (idx, frame) in output.chunks_exact_mut(2).enumerate() {
             for frame in output.chunks_exact_mut(2) {
-                if let Some(sample) = processed_cons.try_pop() {
+                if let Some(sample) = speaker_cons.try_pop() {
                     frame[0] = sample;
                     frame[1] = sample;
-                    far_end_prod.push_slice(&[sample]);
                 } else {
                     frame[0] = 0.0;
                     frame[1] = 0.0;
                 }
             }
-            // }
-            // }
         },
         |err| panic!("error: {:?}", err),
         None,
@@ -118,7 +85,7 @@ fn main() -> anyhow::Result<()> {
     // mic input audio process thread
     let _audio_process = std::thread::Builder::new()
         .name("Audio Pipeline Thread".to_owned())
-        .spawn(move || audio_processing(mic_cons, far_end_cons, processed_prod));
+        .spawn(move || audio_processing(mic_cons, processed_cons, processed_prod, speaker_prod));
 
     input_stream.play()?;
     output_stream.play()?;

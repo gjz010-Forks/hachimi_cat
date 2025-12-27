@@ -6,15 +6,16 @@ use nnnoiseless::DenoiseState;
 use ringbuf::{
     HeapCons, HeapProd, LocalRb,
     storage::Heap,
-    traits::{Consumer, Producer, Split},
+    traits::{Consumer, Observer, Producer, Split},
 };
 
-use crate::constant::*;
+use crate::{constant::*, limiter::SmoothLimiter, noise_gate::*};
 
 pub fn audio_processing(
     mut mic_cons: HeapCons<f32>,
-    mut far_end_cons: HeapCons<f32>,
-    mut processed_prod: HeapProd<f32>,
+    mut ref_cons: HeapCons<f32>,
+    mut mic_prod: HeapProd<f32>,
+    mut ref_prod: HeapProd<f32>,
 ) {
     let coeffs = Coefficients::<f32>::from_params(
         Type::HighPass,
@@ -33,55 +34,73 @@ pub fn audio_processing(
     // .expect("Failed to create coefficients");
 
     // state machine init
+    let mut ref_limiter = SmoothLimiter::new(0.9, 1.0, 80.0, SAMPLE_RATE as f32);
+    let mut noise_gate = VoipSoftGate::new(0.01, 0.001, 1.0, 80.0, SAMPLE_RATE as f32);
     let mut aec_state = FdafAec::<AEC_FFT_SIZE>::new(STEP_SIZE, 0.9, 10e-4);
     let mut denoise = DenoiseState::new();
     let mut mic_hpfilter = DirectForm2Transposed::<f32>::new(coeffs);
     let mut far_end_hpfilter = DirectForm2Transposed::<f32>::new(coeffs);
-    let mut nlp_filter = DirectForm2Transposed::<f32>::new(coeffs);
-    // let mut nlp_lpfilter = DirectForm2Transposed::<f32>::new(nlp_lpfilter);
+    // let mut nlp_filter = DirectForm2Transposed::<f32>::new(coeffs);
 
     // local ringbuffer
-    let hpf_mic_to_aec = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
-    let (mut hpf_mic_prod, mut aec_mic_cons) = hpf_mic_to_aec.split();
-    let hpf_far_end_to_aec = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
-    let (mut hpf_far_end_prod, mut aec_far_end_cons) = hpf_far_end_to_aec.split();
+    let ref_limit_rb = LocalRb::<Heap<f32>>::new(FRAME_SIZE * 4);
+    let (mut ref_limit_prod, mut ref_limit_cons) = ref_limit_rb.split();
+    let dispatch_rb = LocalRb::<Heap<f32>>::new(FRAME_SIZE * 4);
+    let (mut dispatch_prod, mut dispatch_cons) = dispatch_rb.split();
 
-    let aec_to_nlp = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
-    let (mut aec_prod, mut nlp_cons) = aec_to_nlp.split();
+    let hpf_mic_rb = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
+    let (mut hpf_mic_prod, mut hpf_mic_cons) = hpf_mic_rb.split();
+    let hpf_ref_rb = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
+    let (mut hpf_ref_prod, mut hpf_ref_cons) = hpf_ref_rb.split();
 
-    let nlp_to_ns = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
-    let (mut nlp_prod, mut ns_cons) = nlp_to_ns.split();
+    let aec_rb = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
+    let (mut aec_prod, mut aec_cons) = aec_rb.split();
+
+    let nlp_rb = LocalRb::<Heap<f32>>::new(FRAME_SIZE.max(AEC_FRAME_SIZE) * 4);
+    let (mut nlp_prod, mut nlp_cons) = nlp_rb.split();
 
     // signal process main loop
     loop {
-        // pre mic input HighPassFilter
+        // pre process mic input HighPassFilter
         hpf(&mut mic_hpfilter, &mut mic_cons, &mut hpf_mic_prod);
+        // pre process far end ref
+        limit(&mut ref_limiter, &mut ref_cons, &mut ref_limit_prod);
 
-        // pre far end HighPassFilter
-        // FIXME: move to output thread
-        hpf(
-            &mut far_end_hpfilter,
-            &mut far_end_cons,
-            &mut hpf_far_end_prod,
-        );
+        // ref dispatch
+        while ref_limit_cons.occupied_len() >= FRAME_SIZE
+            && ref_prod.vacant_len() >= FRAME_SIZE
+            && hpf_ref_prod.vacant_len() >= FRAME_SIZE
+        {
+            let mut frame = [0f32; FRAME_SIZE];
+            ref_limit_cons.pop_slice(&mut frame);
+            ref_prod.push_slice(&frame);
+            dispatch_prod.push_slice(&frame);
+        }
+
+        // pre process far end ref HighPassFilter
+        hpf(&mut far_end_hpfilter, &mut dispatch_cons, &mut hpf_ref_prod);
 
         // aec (echo cancel)
         aec(
             &mut aec_state,
-            &mut aec_mic_cons,
-            &mut aec_far_end_cons,
+            &mut hpf_mic_cons,
+            &mut hpf_ref_cons,
             &mut aec_prod,
         );
 
-        nlp(&mut nlp_filter, &mut nlp_cons, &mut nlp_prod);
+        nlp(
+            // &mut nlp_filter,
+            &mut noise_gate,
+            &mut aec_cons,
+            &mut nlp_prod,
+        );
 
-        noiseless(&mut denoise, &mut ns_cons, &mut processed_prod);
+        noiseless(&mut denoise, &mut nlp_cons, &mut mic_prod);
 
         std::thread::sleep(Duration::from_millis(16));
     }
 }
 
-#[inline(always)]
 pub fn hpf(
     filter: &mut DirectForm2Transposed<f32>,
     cons: &mut impl Consumer<Item = f32>,
@@ -96,6 +115,19 @@ pub fn hpf(
             *i = filter.run(*i);
         }
         prod.push_slice(&hpf_frame);
+    }
+}
+
+pub fn limit(
+    limiter: &mut SmoothLimiter,
+    cons: &mut impl Consumer<Item = f32>,
+    prod: &mut impl Producer<Item = f32>,
+) {
+    let mut frame = [0f32; FRAME_SIZE];
+    while cons.occupied_len() >= FRAME_SIZE && prod.vacant_len() >= FRAME_SIZE {
+        cons.pop_slice(&mut frame);
+        limiter.process(&mut frame);
+        prod.push_slice(&frame);
     }
 }
 
@@ -123,13 +155,13 @@ pub fn aec(
             mic_frame.first_chunk().unwrap(),
         );
 
-        // processed_prod.push_slice(&aec_output_frame);
         prod.push_slice(&output_frame);
     }
 }
 
 pub fn nlp(
-    nlp_filter: &mut DirectForm2Transposed<f32>,
+    // nlp_filter: &mut DirectForm2Transposed<f32>,
+    noise_gate: &mut VoipSoftGate,
     cons: &mut impl Consumer<Item = f32>,
     prod: &mut impl Producer<Item = f32>,
 ) {
@@ -137,11 +169,10 @@ pub fn nlp(
 
     while cons.occupied_len() >= FRAME_SIZE && prod.vacant_len() >= FRAME_SIZE {
         cons.pop_slice(&mut nlp_frame);
-        for i in nlp_frame.iter_mut() {
-            *i = nlp_filter.run(*i);
-            // *i = nlp_lpfilter.run(*i);
-        }
-        // TODO: noise gate
+        // for i in nlp_frame.iter_mut() {
+        // *i = nlp_filter.run(*i);
+        // }
+        noise_gate.process(&mut nlp_frame);
         sanitize(&mut nlp_frame);
         prod.push_slice(&nlp_frame);
     }
